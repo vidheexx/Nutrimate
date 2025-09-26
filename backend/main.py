@@ -6,10 +6,12 @@ import bcrypt
 import os
 import jwt
 from datetime import datetime, timedelta
+import base64
 
-SECRET_KEY = "supersecretkey"
+# === CONFIG ===
+SECRET_KEY = "supersecretkey"  # ⚠️ change in production
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 day
 
 # === FIREBASE INIT ===
 sa_path = "serviceAccountKey.json"
@@ -23,7 +25,7 @@ db = firestore.client()
 
 app = FastAPI(title="Nutrimate Backend")
 
-# === Auth helpers ===
+# === HELPERS ===
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -46,11 +48,13 @@ def get_current_user(request: Request):
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# === Models ===
+# === MODELS ===
 class RegisterReq(BaseModel):
     name: str
     email: str
     password: str
+    bowl_size: int
+    target_weight: float
 
 class LoginReq(BaseModel):
     email: str
@@ -63,7 +67,10 @@ class MealReq(BaseModel):
     name: str
     macros: dict
 
-# === Routes ===
+class AnalyzeReq(BaseModel):
+    image: str  # base64 string
+
+# === ROUTES ===
 @app.post("/register")
 def register(data: RegisterReq):
     users_ref = db.collection("users").document(data.email)
@@ -75,7 +82,9 @@ def register(data: RegisterReq):
         "name": data.name,
         "email": data.email,
         "password": hashed_pw,
-        "goal": 2000
+        "goal": 2000,
+        "bowl_size": data.bowl_size,
+        "target_weight": data.target_weight,
     })
     return {"ok": True, "msg": "User registered successfully"}
 
@@ -90,7 +99,52 @@ def login(data: LoginReq):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token({"sub": user["email"]})
-    return {"ok": True, "token": token, "email": user["email"], "name": user.get("name", "")}
+    return {
+        "ok": True,
+        "token": token,
+        "email": user["email"],
+        "name": user.get("name", ""),
+        "bowl_size": user.get("bowl_size", 250),
+        "target_weight": user.get("target_weight", 0),
+    }
+
+@app.post("/analyze")
+def analyze(req: AnalyzeReq, email: str = Depends(get_current_user)):
+    user_doc = db.collection("users").document(email).get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+    user = user_doc.to_dict()
+    bowl_size = user.get("bowl_size", 250)
+
+    try:
+        img_bytes = base64.b64decode(req.image)
+        s = len(img_bytes)
+    except Exception:
+        s = 25000
+
+    # fake base macros
+    base_cal = 150 + (s % 151)  # 150–300
+    base_pro = 5 + (s % 16)     # 5–20
+    base_car = 20 + (s % 31)    # 20–50
+    base_fat = 5 + (s % 11)     # 5–15
+
+    factor = bowl_size / 100.0
+    macros = {
+        "calories": int(round(base_cal * factor)),
+        "protein": round(base_pro * factor, 1),
+        "carbs": round(base_car * factor, 1),
+        "fats": round(base_fat * factor, 1),
+    }
+
+    meal_id = f"{email}_{datetime.utcnow().isoformat()}"
+    db.collection("meals").document(meal_id).set({
+        "email": email,
+        "name": "Bowl Meal",
+        "macros": macros,
+        "created": datetime.utcnow().isoformat()
+    })
+
+    return {"ok": True, "macros": macros, "bowl_size": bowl_size}
 
 @app.post("/add-meal")
 def add_meal(data: MealReq, email: str = Depends(get_current_user)):
@@ -106,7 +160,6 @@ def add_meal(data: MealReq, email: str = Depends(get_current_user)):
 @app.get("/today")
 def today(email: str = Depends(get_current_user)):
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
-
     meals_ref = db.collection("meals").where("email", "==", email).stream()
 
     total = 0
@@ -118,10 +171,16 @@ def today(email: str = Depends(get_current_user)):
             cals = data.get("macros", {}).get("calories", 0) or 0
             total += cals
             today_meals.append(data)
-
     return {"email": email, "date": today_str, "calories": total, "meals": today_meals}
 
-@app.get("/get-goal")   # ✅ missing decorator added back
+@app.get("/history")
+def get_history(email: str = Depends(get_current_user)):
+    meals_ref = db.collection("meals").where("email", "==", email).stream()
+    meals = [doc.to_dict() for doc in meals_ref]
+    meals.sort(key=lambda x: x.get("created", ""), reverse=True)
+    return {"email": email, "meals": meals}
+
+@app.get("/get-goal")
 def get_goal(email: str = Depends(get_current_user)):
     doc = db.collection("users").document(email).get()
     if doc.exists:
